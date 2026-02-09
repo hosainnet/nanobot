@@ -7,7 +7,7 @@ import re
 from typing import TYPE_CHECKING
 
 from loguru import logger
-from telegram import BotCommand, Update
+from telegram import BotCommand, Message, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 from nanobot.bus.events import OutboundMessage
@@ -112,6 +112,8 @@ class TelegramChannel(BaseChannel):
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
+        self._bot_username: str | None = None  # e.g. "my_bot"
+        self._bot_id: int | None = None
     
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -149,6 +151,8 @@ class TelegramChannel(BaseChannel):
         
         # Get bot info and register command menu
         bot_info = await self._app.bot.get_me()
+        self._bot_username = bot_info.username
+        self._bot_id = bot_info.id
         logger.info(f"Telegram bot @{bot_info.username} connected")
         
         try:
@@ -269,7 +273,11 @@ class TelegramChannel(BaseChannel):
         message = update.message
         user = update.effective_user
         chat_id = message.chat_id
-        
+
+        # In group chats, only respond when the bot is mentioned or replied to
+        if message.chat.type != "private" and not self._is_bot_addressed(message):
+            return
+
         # Use stable numeric ID, but keep username for allowlist compatibility
         sender_id = str(user.id)
         if user.username:
@@ -282,11 +290,11 @@ class TelegramChannel(BaseChannel):
         content_parts = []
         media_paths = []
         
-        # Text content
+        # Text content (strip bot @mention so the LLM sees clean input)
         if message.text:
-            content_parts.append(message.text)
+            content_parts.append(self._strip_bot_mention(message.text))
         if message.caption:
-            content_parts.append(message.caption)
+            content_parts.append(self._strip_bot_mention(message.caption))
         
         # Handle media files
         media_file = None
@@ -363,6 +371,32 @@ class TelegramChannel(BaseChannel):
             }
         )
     
+    def _is_bot_addressed(self, message: Message) -> bool:
+        """Check if the bot is mentioned or replied to in this message."""
+        # Check if this is a reply to the bot's own message
+        if (
+            message.reply_to_message
+            and message.reply_to_message.from_user
+            and self._bot_id
+            and message.reply_to_message.from_user.id == self._bot_id
+        ):
+            return True
+
+        # Check message entities for an @mention of the bot
+        if self._bot_username:
+            mention = f"@{self._bot_username}"
+            text = message.text or message.caption or ""
+            if mention.lower() in text.lower():
+                return True
+
+        return False
+
+    def _strip_bot_mention(self, text: str) -> str:
+        """Remove the bot's @username mention from text."""
+        if not text or not self._bot_username:
+            return text
+        return re.sub(rf"@{re.escape(self._bot_username)}\s*", "", text, flags=re.IGNORECASE).strip()
+
     def _start_typing(self, chat_id: str) -> None:
         """Start sending 'typing...' indicator for a chat."""
         # Cancel any existing typing task for this chat
